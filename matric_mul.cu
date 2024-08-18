@@ -227,7 +227,7 @@ __global__ void matrix_multiply_v5(float* G_A, float* G_B, float* G_C, float alp
 
             for (int a_i = 0;a_i < TM;a_i++){
                 for (int b_i = 0;b_i < TN;b_i++){
-                    gridRegister[a_i*TM + b_i] += mRegister[a_i]*nResgiter[b_i];
+                    gridRegister[a_i*TN + b_i] += mRegister[a_i]*nResgiter[b_i];
                 }
             }
 
@@ -239,13 +239,98 @@ __global__ void matrix_multiply_v5(float* G_A, float* G_B, float* G_C, float alp
 
     for (int i = 0; i < TM; ++i){
         for (int j = 0; j < TN; ++j){
-            G_C[(threadRow*TM + i)*N + (threadCol*TN + j)] = alpha*gridRegister[i*TM + j] + beta * G_C[(threadRow*TM + i)*N + (threadCol*TN + j)];
+            G_C[(threadRow*TM + i)*N + (threadCol*TN + j)] = alpha*gridRegister[i*TN + j] + beta * G_C[(threadRow*TM + i)*N + (threadCol*TN + j)];
         }
         
     }
   
 }
 
+
+__global__ void matrix_multiply_v6(float* G_A, float* G_B, float* G_C, float alpha, float beta, int M, int K, int N){
+
+    __shared__ float As[128*8];
+    __shared__ float Bs[128*8];
+
+    int cRow = blockIdx.y;
+    int cCol = blockIdx.x;
+
+    G_A += cRow*2*BM*K;
+    G_B += cCol*2*BN;
+    G_C += cRow*2*BM*N + cCol*2*BN;
+
+    float gridRegister[TM * TN] = {0.0};
+
+    float mRegister[TM] = {0.0};
+    float nResgiter[TN] = {0.0};
+
+
+    int innerRowA = threadIdx.x / (BK/4);
+    int innerColA = threadIdx.x % (BK/4);
+    int innerRowB = threadIdx.x / ((2*BN) / 4);
+    int innerColB = threadIdx.x % ((2*BN) / 4);
+
+    int threadRow = threadIdx.x / 16;
+    int threadCol = threadIdx.x % 16;
+
+    for (int i = 0; i < K; i+=BK){
+
+        float4 temp = reinterpret_cast<float4* >(&G_A[innerRowA*K + innerColA*4])[0];
+        As[(innerColA*4 + 0)*2*BM + innerRowA] = temp.x;
+        As[(innerColA*4 + 1)*2*BM + innerRowA] = temp.y;
+        As[(innerColA*4 + 2)*2*BM + innerRowA] = temp.z;
+        As[(innerColA*4 + 3)*2*BM + innerRowA] = temp.w;
+
+        reinterpret_cast<float4* >(&Bs[innerRowB*2*BN + innerColB * 4])[0] = reinterpret_cast<float4* >(&G_B[innerRowB*N + innerColB*4])[0];
+
+
+        __syncthreads();
+
+        G_A += BK;
+        G_B += BK*N;
+
+        for (int j = 0; j < BK; j++){
+
+            for (int j_a = 0; j_a < TM; j_a++){
+                // mRegister[j_a] = As[(threadRow*TM + j_a)*BK + j];
+                mRegister[j_a] = As[j*2*BM + threadRow*TM + j_a];
+            }
+
+            for (int j_b = 0;j_b < TN;j_b++){
+                nResgiter[j_b] = Bs[j*2*BN + threadCol*TN + j_b];
+            }
+
+            for (int a_i = 0;a_i < TM;a_i++){
+                for (int b_i = 0;b_i < TN;b_i++){
+                    gridRegister[a_i*TN + b_i] += mRegister[a_i]*nResgiter[b_i];
+                }
+            }
+
+        }
+
+        __syncthreads();
+
+    }
+
+    for (int i = 0; i < TM; ++i){
+        for (int j = 0; j < TN; j+=4){
+            float4 temp = reinterpret_cast<float4* >(&G_C[(threadRow*TM + i)*N + (threadCol*TN + j)])[0];
+            temp.x = alpha*gridRegister[i*TN + j + 0] + beta*temp.x;
+            temp.y = alpha*gridRegister[i*TN + j + 1] + beta*temp.y;
+            temp.z = alpha*gridRegister[i*TN + j + 2] + beta*temp.z;
+            temp.w = alpha*gridRegister[i*TN + j + 3] + beta*temp.w;
+
+            reinterpret_cast<float4* >(&G_C[(threadRow*TM + i)*N + (threadCol*TN + j)])[0] = temp;
+        }   
+    }
+    // for (int i = 0; i < TM; ++i){
+    //     for (int j = 0; j < TN; ++j){
+    //         G_C[(threadRow*TM + i)*N + (threadCol*TN + j)] = alpha*gridRegister[i*TN + j] + beta * G_C[(threadRow*TM + i)*N + (threadCol*TN + j)];
+    //     }
+        
+    // }
+  
+}
 
 
 int main(int c, char *arg[]){
@@ -337,12 +422,17 @@ int main(int c, char *arg[]){
         dim3 gridDim(CEIL_DIV(N, 64), CEIL_DIV(M, 64), 1);
         dim3 blockDim(64*8, 1);
         matrix_multiply_v4<<<gridDim, blockDim>>>(D_A, D_B, D_C, alpha, beta, M, K, N);
-    }else{
+    }else if (strcmp(imp, "imp_5") == 0){
         printf("implementation 5 is being executed %s", imp);
         dim3 gridDim(CEIL_DIV(N, 64), CEIL_DIV(M, 64), 1);
         dim3 blockDim(8*8, 1);
         matrix_multiply_v5<<<gridDim, blockDim>>>(D_A, D_B, D_C, alpha, beta, M, K, N);
         
+    } else {
+        printf("implementation 6 is being executed %s", imp);
+        dim3 gridDim(CEIL_DIV(N, 128), CEIL_DIV(M, 128), 1);
+        dim3 blockDim(16*16, 1);
+        matrix_multiply_v6<<<gridDim, blockDim>>>(D_A, D_B, D_C, alpha, beta, M, K, N);
     }
     // matrix_multiply<<<gridDim, blockDim>>>(D_A, D_B, D_C, alpha, beta, M, K, N);
 
